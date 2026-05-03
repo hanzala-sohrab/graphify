@@ -150,6 +150,7 @@ def _import_python(node, source: bytes, file_nid: str, stem: str, edges: list, s
                     "source": file_nid,
                     "target": tgt_nid,
                     "relation": "imports",
+                    "context": "import",
                     "confidence": "EXTRACTED",
                     "source_file": str_path,
                     "source_location": f"L{node.start_point[0] + 1}",
@@ -174,6 +175,7 @@ def _import_python(node, source: bytes, file_nid: str, stem: str, edges: list, s
                 "source": file_nid,
                 "target": tgt_nid,
                 "relation": "imports_from",
+                "context": "import",
                 "confidence": "EXTRACTED",
                 "source_file": str_path,
                 "source_location": f"L{node.start_point[0] + 1}",
@@ -221,6 +223,7 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
                 "source": file_nid,
                 "target": tgt_nid,
                 "relation": "imports_from",
+                "context": "import",
                 "confidence": "EXTRACTED",
                 "source_file": str_path,
                 "source_location": f"L{node.start_point[0] + 1}",
@@ -248,11 +251,91 @@ def _import_js(node, source: bytes, file_nid: str, stem: str, edges: list, str_p
                                         "source": file_nid,
                                         "target": _make_id(target_stem, sym),
                                         "relation": "imports",
+                                        "context": "import",
                                         "confidence": "EXTRACTED",
                                         "source_file": str_path,
                                         "source_location": f"L{line}",
                                         "weight": 1.0,
                                     })
+
+
+def _dynamic_import_js(node, source: bytes, caller_nid: str, str_path: str, edges: list,
+                       seen_dyn_pairs: set) -> bool:
+    """Detect dynamic import() calls in JS/TS and emit imports_from edges.
+
+    Handles patterns like:
+      await import('./foo.js')
+      import('./foo.js').then(...)
+      const m = await import(`./foo`)
+
+    Returns True if the node was a dynamic import (caller should skip normal call handling).
+    """
+    # Dynamic import is a call_expression whose function child is the keyword "import".
+    # tree-sitter-typescript parses `import('...')` as call_expression with first child
+    # being an "import" token (type="import").
+    func_node = node.child_by_field_name("function")
+    if func_node is None:
+        # Fallback: check first child directly (some TS versions)
+        if node.children and _read_text(node.children[0], source) == "import":
+            func_node = node.children[0]
+        else:
+            return False
+    if _read_text(func_node, source) != "import":
+        return False
+
+    # Extract the module path from the arguments
+    args = node.child_by_field_name("arguments")
+    if args is None:
+        return True  # It's an import() but no args — skip
+    for arg in args.children:
+        if arg.type == "template_string":
+            # Skip dynamic template literals — path can't be statically resolved
+            if any(c.type == "template_substitution" for c in arg.children):
+                break
+            raw = _read_text(arg, source).strip("`")
+        elif arg.type == "string":
+            raw = _read_text(arg, source).strip("'\" ")
+        else:
+            continue
+        if not raw:
+            break
+        # Resolve path using the same logic as static imports
+        if raw.startswith("."):
+            resolved = Path(os.path.normpath(Path(str_path).parent / raw))
+            if resolved.suffix == ".js":
+                resolved = resolved.with_suffix(".ts")
+            elif resolved.suffix == ".jsx":
+                resolved = resolved.with_suffix(".tsx")
+            tgt_nid = _make_id(str(resolved))
+        else:
+            aliases = _load_tsconfig_aliases(Path(str_path).parent)
+            resolved_alias = None
+            for alias_prefix, alias_base in aliases.items():
+                if raw == alias_prefix or raw.startswith(alias_prefix + "/"):
+                    rest = raw[len(alias_prefix):].lstrip("/")
+                    resolved_alias = Path(os.path.normpath(Path(alias_base) / rest))
+                    break
+            if resolved_alias is not None:
+                tgt_nid = _make_id(str(resolved_alias))
+            else:
+                module_name = raw.split("/")[-1]
+                if not module_name:
+                    break
+                tgt_nid = _make_id(module_name)
+        pair = (caller_nid, tgt_nid)
+        if pair not in seen_dyn_pairs:
+            seen_dyn_pairs.add(pair)
+            edges.append({
+                "source": caller_nid,
+                "target": tgt_nid,
+                "relation": "imports_from",
+                "confidence": "EXTRACTED",
+                "source_file": str_path,
+                "source_location": f"L{node.start_point[0] + 1}",
+                "weight": 1.0,
+            })
+        break
+    return True
 
 
 def _import_java(node, source: bytes, file_nid: str, stem: str, edges: list, str_path: str) -> None:
@@ -285,6 +368,7 @@ def _import_java(node, source: bytes, file_nid: str, stem: str, edges: list, str
                     "source": file_nid,
                     "target": tgt_nid,
                     "relation": "imports",
+                    "context": "import",
                     "confidence": "EXTRACTED",
                     "source_file": str_path,
                     "source_location": f"L{node.start_point[0] + 1}",
@@ -304,6 +388,7 @@ def _import_c(node, source: bytes, file_nid: str, stem: str, edges: list, str_pa
                     "source": file_nid,
                     "target": tgt_nid,
                     "relation": "imports",
+                    "context": "import",
                     "confidence": "EXTRACTED",
                     "source_file": str_path,
                     "source_location": f"L{node.start_point[0] + 1}",
@@ -323,6 +408,7 @@ def _import_csharp(node, source: bytes, file_nid: str, stem: str, edges: list, s
                     "source": file_nid,
                     "target": tgt_nid,
                     "relation": "imports",
+                    "context": "import",
                     "confidence": "EXTRACTED",
                     "source_file": str_path,
                     "source_location": f"L{node.start_point[0] + 1}",
@@ -342,6 +428,7 @@ def _import_kotlin(node, source: bytes, file_nid: str, stem: str, edges: list, s
                 "source": file_nid,
                 "target": tgt_nid,
                 "relation": "imports",
+                "context": "import",
                 "confidence": "EXTRACTED",
                 "source_file": str_path,
                 "source_location": f"L{node.start_point[0] + 1}",
@@ -357,6 +444,7 @@ def _import_kotlin(node, source: bytes, file_nid: str, stem: str, edges: list, s
                 "source": file_nid,
                 "target": tgt_nid,
                 "relation": "imports",
+                "context": "import",
                 "confidence": "EXTRACTED",
                 "source_file": str_path,
                 "source_location": f"L{node.start_point[0] + 1}",
@@ -376,6 +464,7 @@ def _import_scala(node, source: bytes, file_nid: str, stem: str, edges: list, st
                     "source": file_nid,
                     "target": tgt_nid,
                     "relation": "imports",
+                    "context": "import",
                     "confidence": "EXTRACTED",
                     "source_file": str_path,
                     "source_location": f"L{node.start_point[0] + 1}",
@@ -395,6 +484,7 @@ def _import_php(node, source: bytes, file_nid: str, stem: str, edges: list, str_
                     "source": file_nid,
                     "target": tgt_nid,
                     "relation": "imports",
+                    "context": "import",
                     "confidence": "EXTRACTED",
                     "source_file": str_path,
                     "source_location": f"L{node.start_point[0] + 1}",
@@ -677,6 +767,7 @@ def _import_lua(node, source: bytes, file_nid: str, stem: str, edges: list, str_
                 "source": file_nid,
                 "target": module_name,
                 "relation": "imports",
+                "context": "import",
                 "confidence": "EXTRACTED",
                 "confidence_score": 1.0,
                 "source_file": str_path,
@@ -711,12 +802,34 @@ def _import_swift(node, source: bytes, file_nid: str, stem: str, edges: list, st
                 "source": file_nid,
                 "target": tgt_nid,
                 "relation": "imports",
+                "context": "import",
                 "confidence": "EXTRACTED",
                 "source_file": str_path,
                 "source_location": f"L{node.start_point[0] + 1}",
                 "weight": 1.0,
             })
             break
+
+
+def _read_csharp_type_name(node, source: bytes) -> str | None:
+    """Resolve a readable C# type name from a field/type node."""
+    if node is None:
+        return None
+    if node.type in ("identifier", "predefined_type"):
+        return _read_text(node, source)
+    if node.type == "qualified_name":
+        return _read_text(node, source).split(".")[-1]
+    if node.type == "generic_name":
+        name_node = node.child_by_field_name("name")
+        if name_node is not None:
+            return _read_text(name_node, source)
+    for child in node.children:
+        if not child.is_named:
+            continue
+        name = _read_csharp_type_name(child, source)
+        if name:
+            return name
+    return None
 
 
 _SWIFT_CONFIG = LanguageConfig(
@@ -733,7 +846,6 @@ _SWIFT_CONFIG = LanguageConfig(
     function_boundary_types=frozenset({"function_declaration", "init_declaration", "deinit_declaration", "subscript_declaration"}),
     import_handler=_import_swift,
 )
-
 
 # ── Generic extractor ─────────────────────────────────────────────────────────
 
@@ -782,8 +894,9 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             })
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
-                 confidence: str = "EXTRACTED", weight: float = 1.0) -> None:
-        edges.append({
+                 confidence: str = "EXTRACTED", weight: float = 1.0,
+                 context: str | None = None) -> None:
+        edge = {
             "source": src,
             "target": tgt,
             "relation": relation,
@@ -791,7 +904,19 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             "source_file": str_path,
             "source_location": f"L{line}",
             "weight": weight,
-        })
+        }
+        if context:
+            edge["context"] = context
+        edges.append(edge)
+
+    def ensure_named_node(name: str, line: int) -> str:
+        nid = _make_id(stem, name)
+        if nid in seen_ids:
+            return nid
+        nid = _make_id(name)
+        if nid not in seen_ids:
+            add_node(nid, name, line)
+        return nid
 
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
@@ -990,6 +1115,23 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
                             break
             return
 
+        if (config.ts_module == "tree_sitter_c_sharp"
+                and t == "field_declaration"
+                and parent_class_nid):
+            type_node = node.child_by_field_name("type")
+            if type_node is None:
+                for child in node.children:
+                    if child.type == "variable_declaration":
+                        type_node = child.child_by_field_name("type")
+                        if type_node is not None:
+                            break
+            type_name = _read_csharp_type_name(type_node, source)
+            if type_name:
+                line = node.start_point[0] + 1
+                add_edge(parent_class_nid, ensure_named_node(type_name, line),
+                         "references", line, context="field")
+            return
+
         # Function types
         if t in config.function_types:
             # Swift deinit/subscript have no name field — resolve before generic fallback
@@ -1063,6 +1205,7 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
         label_to_nid[normalised.lower()] = n["id"]
 
     seen_call_pairs: set[tuple[str, str]] = set()
+    seen_dyn_import_pairs: set[tuple[str, str]] = set()
     seen_static_ref_pairs: set[tuple[str, str, str]] = set()
     seen_helper_ref_pairs: set[tuple[str, str, str]] = set()
     seen_bind_pairs: set[tuple[str, str, str]] = set()
@@ -1084,6 +1227,15 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             return
 
         if node.type in config.call_types:
+            # JS/TS dynamic imports: await import('./foo.js')
+            if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
+                if _dynamic_import_js(node, source, caller_nid, str_path,
+                                      edges, seen_dyn_import_pairs):
+                    # Still recurse into children (import().then(...) may have calls)
+                    for child in node.children:
+                        walk_calls(child, caller_nid)
+                    return
+
             callee_name: str | None = None
             is_member_call: bool = False
 
@@ -1203,6 +1355,7 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
                             "source": caller_nid,
                             "target": tgt_nid,
                             "relation": "calls",
+                            "context": "call",
                             "confidence": "EXTRACTED",
                             "source_file": str_path,
                             "source_location": f"L{line}",
@@ -1926,8 +2079,9 @@ def extract_julia(path: Path) -> dict:
             })
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
-                 confidence: str = "EXTRACTED", weight: float = 1.0) -> None:
-        edges.append({
+                 confidence: str = "EXTRACTED", weight: float = 1.0,
+                 context: str | None = None) -> None:
+        edge = {
             "source": src,
             "target": tgt,
             "relation": relation,
@@ -1935,7 +2089,10 @@ def extract_julia(path: Path) -> dict:
             "source_file": str_path,
             "source_location": f"L{line}",
             "weight": weight,
-        })
+        }
+        if context:
+            edge["context"] = context
+        edges.append(edge)
 
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
@@ -1962,14 +2119,14 @@ def extract_julia(path: Path) -> dict:
                 callee_name = _read_text(callee, source)
                 target_nid = _make_id(stem, callee_name)
                 add_edge(func_nid, target_nid, "calls", body_node.start_point[0] + 1,
-                         confidence="EXTRACTED")
+                         confidence="EXTRACTED", context="call")
             # Method call: obj.method(...)
             elif callee.type == "field_expression" and len(callee.children) >= 3:
                 method_node = callee.children[-1]
                 method_name = _read_text(method_node, source)
                 target_nid = _make_id(stem, method_name)
                 add_edge(func_nid, target_nid, "calls", body_node.start_point[0] + 1,
-                         confidence="EXTRACTED")
+                         confidence="EXTRACTED", context="call")
         for child in body_node.children:
             walk_calls(child, func_nid)
 
@@ -2070,14 +2227,14 @@ def extract_julia(path: Path) -> dict:
                     mod_name = _read_text(child, source)
                     imp_nid = _make_id(mod_name)
                     add_node(imp_nid, mod_name, line)
-                    add_edge(scope_nid, imp_nid, "imports", line)
+                    add_edge(scope_nid, imp_nid, "imports", line, context="import")
                 elif child.type == "selected_import":
                     identifiers = [c for c in child.children if c.type == "identifier"]
                     if identifiers:
                         pkg_name = _read_text(identifiers[0], source)
                         pkg_nid = _make_id(pkg_name)
                         add_node(pkg_nid, pkg_name, line)
-                        add_edge(scope_nid, pkg_nid, "imports", line)
+                        add_edge(scope_nid, pkg_nid, "imports", line, context="import")
             return
 
         for child in node.children:
@@ -2142,8 +2299,9 @@ def extract_go(path: Path) -> dict:
             })
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
-                 confidence: str = "EXTRACTED", weight: float = 1.0) -> None:
-        edges.append({
+                 confidence: str = "EXTRACTED", weight: float = 1.0,
+                 context: str | None = None) -> None:
+        edge = {
             "source": src,
             "target": tgt,
             "relation": relation,
@@ -2151,7 +2309,10 @@ def extract_go(path: Path) -> dict:
             "source_file": str_path,
             "source_location": f"L{line}",
             "weight": weight,
-        })
+        }
+        if context:
+            edge["context"] = context
+        edges.append(edge)
 
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
@@ -2225,7 +2386,7 @@ def extract_go(path: Path) -> dict:
                                 # Prefix with go_pkg_ so stdlib names (e.g. "context")
                                 # don't collide with local files of the same basename.
                                 tgt_nid = _make_id("go", "pkg", raw)
-                                add_edge(file_nid, tgt_nid, "imports_from", spec.start_point[0] + 1)
+                                add_edge(file_nid, tgt_nid, "imports_from", spec.start_point[0] + 1, context="import")
                                 # Track local name (alias or last path segment)
                                 alias = spec.child_by_field_name("name")
                                 local_name = _read_text(alias, source) if alias else raw.split("/")[-1]
@@ -2236,7 +2397,7 @@ def extract_go(path: Path) -> dict:
                     if path_node:
                         raw = _read_text(path_node, source).strip('"')
                         tgt_nid = _make_id("go", "pkg", raw)
-                        add_edge(file_nid, tgt_nid, "imports_from", child.start_point[0] + 1)
+                        add_edge(file_nid, tgt_nid, "imports_from", child.start_point[0] + 1, context="import")
                         alias = child.child_by_field_name("name")
                         local_name = _read_text(alias, source) if alias else raw.split("/")[-1]
                         if local_name and local_name != "_" and local_name != ".":
@@ -2287,6 +2448,7 @@ def extract_go(path: Path) -> dict:
                             "source": caller_nid,
                             "target": tgt_nid,
                             "relation": "calls",
+                            "context": "call",
                             "confidence": "EXTRACTED",
                             "source_file": str_path,
                             "source_location": f"L{line}",
@@ -2354,8 +2516,9 @@ def extract_rust(path: Path) -> dict:
             })
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
-                 confidence: str = "EXTRACTED", weight: float = 1.0) -> None:
-        edges.append({
+                 confidence: str = "EXTRACTED", weight: float = 1.0,
+                 context: str | None = None) -> None:
+        edge = {
             "source": src,
             "target": tgt,
             "relation": relation,
@@ -2363,7 +2526,10 @@ def extract_rust(path: Path) -> dict:
             "source_file": str_path,
             "source_location": f"L{line}",
             "weight": weight,
-        })
+        }
+        if context:
+            edge["context"] = context
+        edges.append(edge)
 
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
@@ -2420,7 +2586,7 @@ def extract_rust(path: Path) -> dict:
                 module_name = clean.split("::")[-1].strip()
                 if module_name:
                     tgt_nid = _make_id(module_name)
-                    add_edge(file_nid, tgt_nid, "imports_from", node.start_point[0] + 1)
+                    add_edge(file_nid, tgt_nid, "imports_from", node.start_point[0] + 1, context="import")
             return
 
         for child in node.children:
@@ -2467,6 +2633,7 @@ def extract_rust(path: Path) -> dict:
                             "source": caller_nid,
                             "target": tgt_nid,
                             "relation": "calls",
+                            "context": "call",
                             "confidence": "EXTRACTED",
                             "source_file": str_path,
                             "source_location": f"L{line}",
@@ -2529,10 +2696,14 @@ def extract_zig(path: Path) -> dict:
                           "source_file": str_path, "source_location": f"L{line}"})
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
-                 confidence: str = "EXTRACTED", weight: float = 1.0) -> None:
-        edges.append({"source": src, "target": tgt, "relation": relation,
-                      "confidence": confidence, "source_file": str_path,
-                      "source_location": f"L{line}", "weight": weight})
+                 confidence: str = "EXTRACTED", weight: float = 1.0,
+                 context: str | None = None) -> None:
+        edge = {"source": src, "target": tgt, "relation": relation,
+                "confidence": confidence, "source_file": str_path,
+                "source_location": f"L{line}", "weight": weight}
+        if context:
+            edge["context"] = context
+        edges.append(edge)
 
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
@@ -2695,10 +2866,14 @@ def extract_powershell(path: Path) -> dict:
                           "source_file": str_path, "source_location": f"L{line}"})
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
-                 confidence: str = "EXTRACTED", weight: float = 1.0) -> None:
-        edges.append({"source": src, "target": tgt, "relation": relation,
-                      "confidence": confidence, "source_file": str_path,
-                      "source_location": f"L{line}", "weight": weight})
+                 confidence: str = "EXTRACTED", weight: float = 1.0,
+                 context: str | None = None) -> None:
+        edge = {"source": src, "target": tgt, "relation": relation,
+                "confidence": confidence, "source_file": str_path,
+                "source_location": f"L{line}", "weight": weight}
+        if context:
+            edge["context"] = context
+        edges.append(edge)
 
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
@@ -3090,10 +3265,14 @@ def extract_objc(path: Path) -> dict:
                           "source_file": str_path, "source_location": f"L{line}"})
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
-                 confidence: str = "EXTRACTED", weight: float = 1.0) -> None:
-        edges.append({"source": src, "target": tgt, "relation": relation,
-                      "confidence": confidence, "source_file": str_path,
-                      "source_location": f"L{line}", "weight": weight})
+                 confidence: str = "EXTRACTED", weight: float = 1.0,
+                 context: str | None = None) -> None:
+        edge = {"source": src, "target": tgt, "relation": relation,
+                "confidence": confidence, "source_file": str_path,
+                "source_location": f"L{line}", "weight": weight}
+        if context:
+            edge["context"] = context
+        edges.append(edge)
 
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
@@ -3117,7 +3296,7 @@ def extract_objc(path: Path) -> dict:
                     module = raw.split("/")[-1].replace(".h", "")
                     if module:
                         tgt_nid = _make_id(module)
-                        add_edge(file_nid, tgt_nid, "imports", line)
+                        add_edge(file_nid, tgt_nid, "imports", line, context="import")
                 elif child.type == "string_literal":
                     # recurse into string_literal to find string_content
                     for sub in child.children:
@@ -3126,7 +3305,7 @@ def extract_objc(path: Path) -> dict:
                             module = raw.split("/")[-1].replace(".h", "")
                             if module:
                                 tgt_nid = _make_id(module)
-                                add_edge(file_nid, tgt_nid, "imports", line)
+                                add_edge(file_nid, tgt_nid, "imports", line, context="import")
             return
 
         if t == "class_interface":
@@ -3157,7 +3336,7 @@ def extract_objc(path: Path) -> dict:
                             for s in sub.children:
                                 if s.type == "type_identifier":
                                     proto_nid = _make_id(_read(s))
-                                    add_edge(cls_nid, proto_nid, "imports", line)
+                                    add_edge(cls_nid, proto_nid, "imports", line, context="import")
                 elif child.type == "method_declaration":
                     walk(child, cls_nid)
             return
@@ -3249,7 +3428,7 @@ def extract_objc(path: Path) -> dict:
                                 if pair not in seen_calls and caller_nid != candidate:
                                     seen_calls.add(pair)
                                     add_edge(caller_nid, candidate, "calls", body_node.start_point[0] + 1,
-                                             confidence="EXTRACTED", weight=1.0)
+                                             confidence="EXTRACTED", weight=1.0, context="call")
             for child in n.children:
                 walk_calls(child)
         walk_calls(body_node)
@@ -3288,10 +3467,14 @@ def extract_elixir(path: Path) -> dict:
                           "source_file": str_path, "source_location": f"L{line}"})
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
-                 confidence: str = "EXTRACTED", weight: float = 1.0) -> None:
-        edges.append({"source": src, "target": tgt, "relation": relation,
-                      "confidence": confidence, "source_file": str_path,
-                      "source_location": f"L{line}", "weight": weight})
+                 confidence: str = "EXTRACTED", weight: float = 1.0,
+                 context: str | None = None) -> None:
+        edge = {"source": src, "target": tgt, "relation": relation,
+                "confidence": confidence, "source_file": str_path,
+                "source_location": f"L{line}", "weight": weight}
+        if context:
+            edge["context"] = context
+        edges.append(edge)
 
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
@@ -3370,7 +3553,7 @@ def extract_elixir(path: Path) -> dict:
             module_name = _get_alias_text(arguments_node)
             if module_name:
                 tgt_nid = _make_id(module_name)
-                add_edge(file_nid, tgt_nid, "imports", line)
+                add_edge(file_nid, tgt_nid, "imports", line, context="import")
             return
 
         for child in node.children:
@@ -3425,7 +3608,8 @@ def extract_elixir(path: Path) -> dict:
                 if pair not in seen_call_pairs:
                     seen_call_pairs.add(pair)
                     add_edge(caller_nid, tgt_nid, "calls",
-                             node.start_point[0] + 1, confidence="EXTRACTED", weight=1.0)
+                             node.start_point[0] + 1, confidence="EXTRACTED", weight=1.0,
+                             context="call")
             else:
                 raw_calls.append({
                     "caller_nid": caller_nid,
@@ -3466,7 +3650,167 @@ def _check_tree_sitter_version() -> None:
         )
 
 
-def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
+_DISPATCH: dict[str, Any] = {
+    ".py": extract_python,
+    ".js": extract_js,
+    ".jsx": extract_js,
+    ".mjs": extract_js,
+    ".ts": extract_js,
+    ".tsx": extract_js,
+    ".go": extract_go,
+    ".rs": extract_rust,
+    ".java": extract_java,
+    ".c": extract_c,
+    ".h": extract_c,
+    ".cpp": extract_cpp,
+    ".cc": extract_cpp,
+    ".cxx": extract_cpp,
+    ".hpp": extract_cpp,
+    ".rb": extract_ruby,
+    ".cs": extract_csharp,
+    ".kt": extract_kotlin,
+    ".kts": extract_kotlin,
+    ".scala": extract_scala,
+    ".php": extract_php,
+    ".swift": extract_swift,
+    ".lua": extract_lua,
+    ".toc": extract_lua,
+    ".zig": extract_zig,
+    ".ps1": extract_powershell,
+    ".ex": extract_elixir,
+    ".exs": extract_elixir,
+    ".m": extract_objc,
+    ".mm": extract_objc,
+    ".jl": extract_julia,
+    ".vue": extract_js,
+    ".svelte": extract_js,
+    ".dart": extract_dart,
+    ".v": extract_verilog,
+    ".sv": extract_verilog,
+    ".sql": extract_sql,
+}
+
+
+def _get_extractor(path: Path) -> Any | None:
+    """Return the correct extractor function for a file, or None if unsupported."""
+    if path.name.endswith(".blade.php"):
+        return extract_blade
+    return _DISPATCH.get(path.suffix)
+
+
+def _extract_single_file(args: tuple) -> tuple[int, dict]:
+    """Worker function for parallel extraction. Runs in a subprocess.
+
+    Must be at module level (not a closure) so it can be pickled by
+    ProcessPoolExecutor.
+
+    Args:
+        args: (index, path_str, cache_root_str) tuple
+
+    Returns:
+        (index, result_dict) so results can be placed back in order.
+    """
+    idx, path_str, cache_root_str = args
+    path = Path(path_str)
+    cache_root = Path(cache_root_str)
+
+    # Check cache first (avoid re-extraction)
+    cached = load_cached(path, cache_root)
+    if cached is not None:
+        return idx, cached
+
+    extractor = _get_extractor(path)
+    if extractor is None:
+        return idx, {"nodes": [], "edges": []}
+
+    result = extractor(path)
+    if "error" not in result:
+        save_cached(path, result, cache_root)
+    return idx, result
+
+
+def _extract_parallel(
+    uncached_work: list[tuple[int, Path]],
+    per_file: list[dict | None],
+    effective_root: Path,
+    max_workers: int | None,
+    total_files: int,
+) -> None:
+    """Extract uncached files in parallel using ProcessPoolExecutor."""
+    import concurrent.futures
+
+    if max_workers is None:
+        max_workers = min(os.cpu_count() or 4, len(uncached_work), 8)
+
+    root_str = str(effective_root)
+    work_items = [(idx, str(path), root_str) for idx, path in uncached_work]
+
+    done_count = 0
+    _PROGRESS_INTERVAL = 100
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(_extract_single_file, item): item[0] for item in work_items
+        }
+        for future in concurrent.futures.as_completed(futures):
+            idx, result = future.result()
+            per_file[idx] = result
+            done_count += 1
+            if (
+                total_files >= _PROGRESS_INTERVAL
+                and done_count % _PROGRESS_INTERVAL == 0
+            ):
+                print(
+                    f"  AST extraction: {done_count}/{len(uncached_work)} uncached files "
+                    f"({done_count * 100 // len(uncached_work)}%) [{max_workers} workers]",
+                    flush=True,
+                )
+    if total_files >= _PROGRESS_INTERVAL:
+        print(
+            f"  AST extraction: {total_files}/{total_files} files (100%) [{max_workers} workers]",
+            flush=True,
+        )
+
+
+def _extract_sequential(
+    uncached_work: list[tuple[int, Path]],
+    per_file: list[dict | None],
+    effective_root: Path,
+    total_files: int,
+) -> None:
+    """Extract uncached files sequentially (fallback for small batches)."""
+    _PROGRESS_INTERVAL = 100
+    for work_idx, (idx, path) in enumerate(uncached_work):
+        if (
+            total_files >= _PROGRESS_INTERVAL
+            and work_idx % _PROGRESS_INTERVAL == 0
+            and work_idx > 0
+        ):
+            print(
+                f"  AST extraction: {work_idx}/{len(uncached_work)} uncached files ({work_idx * 100 // len(uncached_work)}%)",
+                flush=True,
+            )
+        extractor = _get_extractor(path)
+        if extractor is None:
+            per_file[idx] = {"nodes": [], "edges": []}
+            continue
+        result = extractor(path)
+        if "error" not in result:
+            save_cached(path, result, effective_root)
+        per_file[idx] = result
+    if total_files >= _PROGRESS_INTERVAL:
+        print(f"  AST extraction: {total_files}/{total_files} files (100%)", flush=True)
+
+
+_PARALLEL_THRESHOLD = 20
+
+
+def extract(
+    paths: list[Path],
+    cache_root: Path | None = None,
+    *,
+    parallel: bool = True,
+    max_workers: int | None = None,
+) -> dict:
     """Extract AST nodes and edges from a list of code files.
 
     Two-pass process:
@@ -3479,9 +3823,11 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
         cache_root: explicit root for graphify-out/cache/ (overrides the
             inferred common path prefix). Pass Path('.') when running on a
             subdirectory so the cache stays at ./graphify-out/cache/.
+        parallel: if True and there are >= _PARALLEL_THRESHOLD uncached files,
+            use ProcessPoolExecutor for multi-core extraction.
+        max_workers: max subprocess count. Defaults to min(cpu_count, 8).
     """
     _check_tree_sitter_version()
-    per_file: list[dict] = []
 
     # Infer a common root for cache keys (use first diverging segment, not sum of all matches)
     try:
@@ -3502,68 +3848,36 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
         root = Path(".")
     root = root.resolve()
 
-    _DISPATCH: dict[str, Any] = {
-        ".py": extract_python,
-        ".js": extract_js,
-        ".jsx": extract_js,
-        ".mjs": extract_js,
-        ".ts": extract_js,
-        ".tsx": extract_js,
-        ".go": extract_go,
-        ".rs": extract_rust,
-        ".java": extract_java,
-        ".c": extract_c,
-        ".h": extract_c,
-        ".cpp": extract_cpp,
-        ".cc": extract_cpp,
-        ".cxx": extract_cpp,
-        ".hpp": extract_cpp,
-        ".rb": extract_ruby,
-        ".cs": extract_csharp,
-        ".kt": extract_kotlin,
-        ".kts": extract_kotlin,
-        ".scala": extract_scala,
-        ".php": extract_php,
-        ".swift": extract_swift,
-        ".lua": extract_lua,
-        ".toc": extract_lua,
-        ".zig": extract_zig,
-        ".ps1": extract_powershell,
-        ".ex": extract_elixir,
-        ".exs": extract_elixir,
-        ".m": extract_objc,
-        ".mm": extract_objc,
-        ".jl": extract_julia,
-        ".vue": extract_js,
-        ".svelte": extract_js,
-        ".dart": extract_dart,
-        ".v": extract_verilog,
-        ".sv": extract_verilog,
-        ".sql": extract_sql,
-    }
-
+    effective_root = cache_root or root
     total = len(paths)
-    _PROGRESS_INTERVAL = 100
+
+    # Phase 1: separate cached hits from uncached work
+    per_file: list[dict | None] = [None] * total
+    uncached_work: list[tuple[int, Path]] = []
+
     for i, path in enumerate(paths):
-        if total >= _PROGRESS_INTERVAL and i % _PROGRESS_INTERVAL == 0 and i > 0:
-            print(f"  AST extraction: {i}/{total} files ({i * 100 // total}%)", flush=True)
-        # .blade.php must be checked before suffix lookup since Path.suffix returns .php
-        if path.name.endswith(".blade.php"):
-            extractor = extract_blade
-        else:
-            extractor = _DISPATCH.get(path.suffix)
-        if extractor is None:
+        if _get_extractor(path) is None:
+            per_file[i] = {"nodes": [], "edges": []}
             continue
-        cached = load_cached(path, cache_root or root)
+        cached = load_cached(path, effective_root)
         if cached is not None:
-            per_file.append(cached)
+            per_file[i] = cached
             continue
-        result = extractor(path)
-        if "error" not in result:
-            save_cached(path, result, cache_root or root)
-        per_file.append(result)
-    if total >= _PROGRESS_INTERVAL:
-        print(f"  AST extraction: {total}/{total} files (100%)", flush=True)
+        uncached_work.append((i, path))
+
+    # Phase 2: extract uncached files (parallel or sequential)
+    if uncached_work:
+        if parallel and len(uncached_work) >= _PARALLEL_THRESHOLD:
+            _extract_parallel(
+                uncached_work, per_file, effective_root, max_workers, total
+            )
+        else:
+            _extract_sequential(uncached_work, per_file, effective_root, total)
+
+    # Fill any remaining None slots (shouldn't happen, but defensive)
+    for i in range(total):
+        if per_file[i] is None:
+            per_file[i] = {"nodes": [], "edges": []}
 
     all_nodes: list[dict] = []
     all_edges: list[dict] = []
@@ -3656,6 +3970,7 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
                     "source": caller,
                     "target": tgt,
                     "relation": "calls",
+                    "context": "call",
                     "confidence": "INFERRED",
                     "confidence_score": 0.8,
                     "source_file": rc.get("source_file", ""),

@@ -736,6 +736,26 @@ _CODEX_HOOK = {
 }
 
 
+def _resolve_graphify_exe() -> str:
+    """Return the absolute path to the graphify executable.
+
+    Falls back to bare 'graphify' if resolution fails. Using an absolute path
+    ensures the hook works in environments where the venv Scripts/ directory is
+    not on PATH (e.g. VS Code Codex extension on Windows).
+    """
+    import shutil
+    found = shutil.which("graphify")
+    if found:
+        return found
+    # Derive from sys.executable: same Scripts/ (Windows) or bin/ (Unix) dir
+    scripts_dir = Path(sys.executable).parent
+    for name in ("graphify.exe", "graphify"):
+        candidate = scripts_dir / name
+        if candidate.exists():
+            return str(candidate)
+    return "graphify"
+
+
 def _install_codex_hook(project_dir: Path) -> None:
     """Add graphify PreToolUse hook to .codex/hooks.json."""
     hooks_path = project_dir / ".codex" / "hooks.json"
@@ -749,11 +769,23 @@ def _install_codex_hook(project_dir: Path) -> None:
     else:
         existing = {}
 
+    graphify_exe = _resolve_graphify_exe()
+    hook_entry = {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": f"{graphify_exe} hook-check"}],
+                }
+            ]
+        }
+    }
+
     pre_tool = existing.setdefault("hooks", {}).setdefault("PreToolUse", [])
     existing["hooks"]["PreToolUse"] = [h for h in pre_tool if "graphify" not in str(h)]
-    existing["hooks"]["PreToolUse"].extend(_CODEX_HOOK["hooks"]["PreToolUse"])
+    existing["hooks"]["PreToolUse"].extend(hook_entry["hooks"]["PreToolUse"])
     hooks_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-    print(f"  .codex/hooks.json  ->  PreToolUse hook registered")
+    print(f"  .codex/hooks.json  ->  PreToolUse hook registered ({graphify_exe} hook-check)")
 
 
 def _uninstall_codex_hook(project_dir: Path) -> None:
@@ -1016,6 +1048,7 @@ def main() -> None:
         print("    --no-viz                skip graph.html generation (useful for >5000 node graphs / CI)")
         print("  query \"<question>\"       BFS traversal of graph.json for a question")
         print("    --dfs                   use depth-first instead of breadth-first")
+        print("    --context C             explicit edge-context filter (repeatable)")
         print("    --budget N              cap output at N tokens (default 2000)")
         print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
         print("  save-result             save a Q&A result to graphify-out/memory/ for graph feedback loop")
@@ -1025,6 +1058,13 @@ def main() -> None:
         print("    --nodes N1 N2 ...       source node labels cited in the answer")
         print("    --memory-dir DIR        memory directory (default: graphify-out/memory)")
         print("  check-update <path>     check needs_update flag and notify if semantic re-extraction is pending (cron-safe)")
+        print("  tree                    emit a D3 v7 collapsible-tree HTML for graph.json")
+        print("    --graph PATH            path to graph.json (default graphify-out/graph.json)")
+        print("    --output HTML           output path (default graphify-out/GRAPH_TREE.html)")
+        print("    --root PATH             filesystem root for the hierarchy")
+        print("    --max-children N        cap children per node (default 200)")
+        print("    --top-k-edges N         per-symbol outbound edges in inspector (default 12)")
+        print("    --label NAME            project label in header")
         print("  benchmark [graph.json]  measure token reduction vs naive full-corpus approach")
         print("  hook install            install post-commit/post-checkout git hooks (all platforms)")
         print("  hook uninstall          remove git hooks")
@@ -1202,15 +1242,16 @@ def main() -> None:
             sys.exit(1)
     elif cmd == "query":
         if len(sys.argv) < 3:
-            print("Usage: graphify query \"<question>\" [--dfs] [--budget N] [--graph path]", file=sys.stderr)
+            print("Usage: graphify query \"<question>\" [--dfs] [--context C] [--budget N] [--graph path]", file=sys.stderr)
             sys.exit(1)
-        from graphify.serve import _score_nodes, _bfs, _dfs, _subgraph_to_text
+        from graphify.serve import _query_graph_text
         from graphify.security import sanitize_label
         from networkx.readwrite import json_graph
         question = sys.argv[2]
         use_dfs = "--dfs" in sys.argv
         budget = 2000
         graph_path = "graphify-out/graph.json"
+        context_filters: list[str] = []
         args = sys.argv[3:]
         i = 0
         while i < len(args):
@@ -1227,6 +1268,12 @@ def main() -> None:
                 except ValueError:
                     print(f"error: --budget must be an integer", file=sys.stderr)
                     sys.exit(1)
+                i += 1
+            elif args[i] == "--context" and i + 1 < len(args):
+                context_filters.append(args[i + 1])
+                i += 2
+            elif args[i].startswith("--context="):
+                context_filters.append(args[i].split("=", 1)[1])
                 i += 1
             elif args[i] == "--graph" and i + 1 < len(args):
                 graph_path = args[i + 1]; i += 2
@@ -1250,14 +1297,16 @@ def main() -> None:
         except Exception as exc:
             print(f"error: could not load graph: {exc}", file=sys.stderr)
             sys.exit(1)
-        terms = [t.lower() for t in question.split() if len(t) > 2]
-        scored = _score_nodes(G, terms)
-        if not scored:
-            print("No matching nodes found.")
-            sys.exit(0)
-        start = [nid for _, nid in scored[:5]]
-        nodes, edges = (_dfs if use_dfs else _bfs)(G, start, depth=2)
-        print(_subgraph_to_text(G, nodes, edges, token_budget=budget))
+        print(
+            _query_graph_text(
+                G,
+                question,
+                mode="dfs" if use_dfs else "bfs",
+                depth=2,
+                token_budget=budget,
+                context_filters=context_filters,
+            )
+        )
     elif cmd == "save-result":
         # graphify save-result --question Q --answer A --type T [--nodes N1 N2 ...]
         import argparse as _ap
@@ -1414,6 +1463,8 @@ def main() -> None:
     elif cmd == "cluster-only":
         watch_path = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(".")
         no_viz = "--no-viz" in sys.argv
+        _min_cs_arg = next((a for a in sys.argv if a.startswith("--min-community-size=")), None)
+        min_community_size = int(_min_cs_arg.split("=")[1]) if _min_cs_arg else 3
         graph_json = watch_path / "graphify-out" / "graph.json"
         if not graph_json.exists():
             print(f"error: no graph found at {graph_json} — run /graphify first", file=sys.stderr)
@@ -1439,7 +1490,8 @@ def main() -> None:
         tokens = {"input": 0, "output": 0}
         report = generate(G, communities, cohesion, labels, gods, surprises,
                           {"warning": "cluster-only mode — file stats not available"},
-                          tokens, str(watch_path), suggested_questions=questions)
+                          tokens, str(watch_path), suggested_questions=questions,
+                          min_community_size=min_community_size)
         out = watch_path / "graphify-out"
         (out / "GRAPH_REPORT.md").write_text(report, encoding="utf-8")
         to_json(G, communities, str(out / "graph.json"))
@@ -1493,23 +1545,9 @@ def main() -> None:
             sys.exit(1)
 
     elif cmd == "hook-check":
-        # Shell-agnostic PreToolUse hook entry point for Codex (and any platform
-        # where embedding Python/bash inline in a JSON hook command is fragile).
-        # Prints the hookSpecificOutput JSON if graph.json exists, exits 0 silently
-        # if not. Works on Windows PowerShell, cmd.exe, macOS, and Linux.
-        graph = Path("graphify-out") / "graph.json"
-        if graph.exists():
-            import json as _json
-            print(_json.dumps({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "additionalContext": (
-                        "graphify: Knowledge graph exists. "
-                        "Read graphify-out/GRAPH_REPORT.md for god nodes and "
-                        "community structure before searching raw files."
-                    ),
-                }
-            }))
+        # Codex Desktop rejects hookSpecificOutput.additionalContext on PreToolUse.
+        # Keep this as a cross-platform no-op so installed hooks never break Bash
+        # tool calls. Graph guidance reaches the agent via AGENTS.md / skill instead.
         sys.exit(0)
     elif cmd == "check-update":
         if len(sys.argv) < 3:
@@ -1518,6 +1556,62 @@ def main() -> None:
         from graphify.watch import check_update
         check_update(Path(sys.argv[2]).resolve())
         sys.exit(0)
+    elif cmd == "tree":
+        # Emit a D3 v7 collapsible-tree HTML view of graph.json:
+        # expand-all / collapse-all / reset-view buttons, multi-line
+        # wrapText labels with separately-coloured name + count,
+        # depth-based palette, click-to-toggle subtree, hover inspector
+        # showing top-K outbound edges per symbol.
+        from typing import Optional as _Opt
+        from graphify.tree_html import write_tree_html, DEFAULT_MAX_CHILDREN
+        graph_path = Path("graphify-out/graph.json")
+        output_path: "_Opt[Path]" = None
+        root: "_Opt[str]" = None
+        max_children = DEFAULT_MAX_CHILDREN
+        top_k_edges = 0
+        project_label: "_Opt[str]" = None
+        args = sys.argv[2:]
+        i_arg = 0
+        while i_arg < len(args):
+            a = args[i_arg]
+            if a == "--graph" and i_arg + 1 < len(args):
+                graph_path = Path(args[i_arg + 1]); i_arg += 2
+            elif a == "--output" and i_arg + 1 < len(args):
+                output_path = Path(args[i_arg + 1]); i_arg += 2
+            elif a == "--root" and i_arg + 1 < len(args):
+                root = args[i_arg + 1]; i_arg += 2
+            elif a == "--max-children" and i_arg + 1 < len(args):
+                max_children = int(args[i_arg + 1]); i_arg += 2
+            elif a == "--top-k-edges" and i_arg + 1 < len(args):
+                top_k_edges = int(args[i_arg + 1]); i_arg += 2
+            elif a == "--label" and i_arg + 1 < len(args):
+                project_label = args[i_arg + 1]; i_arg += 2
+            elif a in ("-h", "--help"):
+                print("Usage: graphify tree [--graph PATH] [--output HTML]")
+                print("  --graph PATH         path to graph.json (default graphify-out/graph.json)")
+                print("  --output HTML        output path (default graphify-out/GRAPH_TREE.html)")
+                print("  --root PATH          filesystem root (default: longest common dir of all source_files)")
+                print("  --max-children N     cap visible children per node (default 200)")
+                print("  --top-k-edges N      pre-compute top-K outbound edges per symbol (default 12)")
+                print("  --label NAME         project label shown in the page header")
+                return
+            else:
+                i_arg += 1
+        if not graph_path.is_file():
+            print(f"error: graph.json not found at {graph_path}", file=sys.stderr)
+            sys.exit(1)
+        if output_path is None:
+            output_path = graph_path.parent / "GRAPH_TREE.html"
+        out = write_tree_html(
+            graph_path=graph_path, output_path=output_path,
+            root=root, max_children=max_children,
+            top_k_edges=top_k_edges, project_label=project_label,
+        )
+        size_kb = out.stat().st_size / 1024
+        print(f"wrote {out} ({size_kb:.1f} KB)")
+        print(f"open with: xdg-open {out}  (or file://{out.resolve()})")
+        sys.exit(0)
+
     elif cmd == "merge-graphs":
         # graphify merge-graphs graph1.json graph2.json ... --out merged.json
         args = sys.argv[2:]
